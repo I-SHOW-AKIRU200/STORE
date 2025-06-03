@@ -1,0 +1,119 @@
+import os
+import base64
+import requests
+from flask import Flask, request, jsonify
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+import ChangeWishListItem_pb2 as wishlist_pb2
+
+app = Flask(name)
+
+# OB49 AES key and IV
+KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+
+# Token resolver
+MAIN_API = "https://main.ffapi.cloud/api/login?access_token="
+
+def get_jwt_token(access_token):
+    if access_token.count('.') == 2:
+        return access_token  # already JWT
+
+    response = requests.get(f"{MAIN_API}{access_token}")
+    if response.ok:
+        data = response.json()
+        if data.get("success") and "bearerToken" in data:
+            return data["bearerToken"]
+    return None
+
+def build_encrypted_wishlist_data(item_id, is_delete=False):
+    req = wishlist_pb2.CSChangeWishListItemReq()
+    
+    if is_delete:
+        req.del_item_ids.append(int(item_id))
+        req.del_source.append("activity_1011")
+    else:
+        req.add_item_ids.append(int(item_id))
+        req.add_source.append("activity_1011")
+    
+    # Serialize and pad
+    serialized_data = req.SerializeToString()
+    padded = pad(serialized_data, AES.block_size)
+
+    # Encrypt with AES-CBC
+    cipher = AES.new(KEY, AES.MODE_CBC, IV)
+    encrypted = cipher.encrypt(padded)
+
+    return base64.b64encode(encrypted).decode()
+
+def send_wishlist_request(encrypted_data, jwt_token, region):
+    if region == "ind":
+        url = "https://client.ind.freefiremobile.com/ChangeWishListItem"
+    elif region in {"br", "us", "sac", "na"}:
+        url = "https://client.us.freefiremobile.com/ChangeWishListItem"
+    else:
+        url = "https://clientbp.ggblueshark.com/ChangeWishListItem"
+
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "ReleaseVersion": "OB49",
+        "User-Agent": "UnityPlayer/2022.3.2f1 (UnityWebRequest/1.0, libcurl/7.84.0-DEV)",
+        "X-GA": "v1 1",
+        "X-Unity-Version": "2022.3.2f1",
+        "Host": url.split("/")[2],
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip"
+    }
+
+    # Send raw binary (not base64)
+    return requests.post(url, headers=headers, data=base64.b64decode(encrypted_data))
+
+@app.route("/add_wishlist_item", methods=["GET"])
+def add_wishlist_item():
+    item_id = request.args.get("item_id")
+    access_token = request.args.get("access_token")
+    region = request.args.get("region")
+
+    if not all([item_id, access_token, region]):
+        return jsonify({"error": "Missing item_id, access_token, or region"}), 400
+
+    jwt_token = get_jwt_token(access_token)
+    if not jwt_token:
+        return jsonify({"error": "Invalid access_token"}), 401
+
+    encrypted_data = build_encrypted_wishlist_data(item_id, is_delete=False)
+    response = send_wishlist_request(encrypted_data, jwt_token, region)
+
+    if response.status_code != 200:
+        return jsonify({"error": "login failed", "response": response.text}), response.status_code
+
+    return jsonify({
+        "status": "success",
+        "message": f"Item ID {item_id} added to wishlist."
+    })
+
+@app.route("/delete_wishlist_item", methods=["GET"])
+def delete_wishlist_item():
+    item_id = request.args.get("item_id")
+    access_token = request.args.get("access_token")
+    region = request.args.get("region")
+
+    if not all([item_id, access_token, region]):
+        return jsonify({"error": "Missing item_id, access_token, or region"}), 400
+
+    jwt_token = get_jwt_token(access_token)
+    if not jwt_token:
+        return jsonify({"error": "Invalid access_token"}), 401
+
+    encrypted_data = build_encrypted_wishlist_data(item_id, is_delete=True)
+    response = send_wishlist_request(encrypted_data, jwt_token, region)
+
+    if response.status_code != 200:
+        return jsonify({"error": "login failed", "response": response.text}), response.status_codereturn jsonify({
+        "status": "item_deleted",
+        "message": f"Item ID {item_id} removed from wishlist."
+    })
+
+if name == "main":
+    app.run(host="0.0.0.0", port=5000)
